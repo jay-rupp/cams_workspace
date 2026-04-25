@@ -134,4 +134,4 @@ The Pi 4 handles high-level control and teleop; the Pico runs the real-time PID 
 
 ## Authors
 
-Built by Jason Rupp and project partner for EECE 5552. Vision and person-tracking pipeline maintained separately.
+Built by Jason Rupp for EECE 5552. Vision and person-tracking pipeline maintained separately.
