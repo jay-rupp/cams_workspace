@@ -1,3 +1,4 @@
+
 """
 CAMS Bot — cascaded PID balance controller
 Pico MicroPython  |  MPU-6050 (I2C)  |  L298N dual H-bridge
@@ -21,54 +22,85 @@ UART1 (commands from Pi 4, 115200 baud)
 
 Serial commands
   D<float>,T<float>,B<float>\n  — drive, turn, boost (joystick ±1.0, trigger 0–1)
-  S\n                           — stop
+  S\n                           — stop (smooth ramp-down)
   K\n                           — kill switch: stop motors and zero state
   R\n                           — resume from kill
 
 Drive model
-  Joystick D value:
-    1. Offsets SETPOINT by ±MAX_DRIVE_ANGLE degrees (balance loop leans)
-    2. Sets VEL_SETPOINT to ±VEL_DRIVE_SCALE ticks/sec (velocity loop drives)
-  Joystick T value: differential PWM between left/right motors for turning.
-  Right trigger B value (0–1): multiplies balance output for extra speed.
+  Joystick D value: lean offset for balance setpoint
+  Joystick T value: differential PWM for turning
+  Right trigger B value: forward throttle (sets velocity setpoint)
+
+Motor deadband compensation (smooth)
+------------------------------------
+Measured: L298N + FIT0186 motors don't start spinning until ~30000 PWM
+under load. Without compensation, the PID issues commands the motors
+ignore until output gets large, then slams.
+
+This file uses a SMOOTH ramp instead of an abrupt step at MIN_CMD:
+- output near zero          → near-zero motor PWM (no jolt)
+- output up to TRANSITION   → offset ramps linearly from 0 → MOTOR_OFFSET
+- output above TRANSITION   → full MOTOR_OFFSET added
+
+This avoids the "instant 30k step at zero crossing" that causes 10Hz
+limit-cycle oscillation around the setpoint.
 """
 
 from machine import Pin, PWM, I2C, UART
 import struct, time, math
 
 # ── Inner loop (balance) tuning ───────────────────────────────────────────────
-SETPOINT       =  0.7    # base tilt target (degrees)
-KP             =  8700.0
+SETPOINT       =  -1.0    # base tilt target (degrees)
+KP             =  1000.0
 KI             =  0.0
-KD             =  2000.0
+KD             =  700.0
 LOOP_HZ        =  100
-DEADBAND       =  0.12   # degrees
+DEADBAND       =  0.3    # degrees
 MAX_OUTPUT     =  65535
-MIN_PWM        =  1000.0
-ALPHA          =  0.98   # complementary filter
-D_FILTER_ALPHA =  0.3   # derivative low-pass
-OUTPUT_FILTER = 0.3
+ALPHA          =  0.98    # complementary filter
+D_FILTER_ALPHA =  0.3     # derivative low-pass
+OUTPUT_FILTER  =  0.3
 
 DT = 1.0 / LOOP_HZ
 
-INTEGRAL_ZONE  = 1.5
+INTEGRAL_ZONE  = 2.0
 INTEGRAL_CLAMP = 8.0
 
+# ── Motor deadband feedforward (smooth) ──────────────────────────────────────
+# MIN_CMD: below this absolute output value, motor is fully off (true zero)
+# MOTOR_OFFSET: full offset added at and above TRANSITION
+# TRANSITION: PID output value at which the offset becomes fully active.
+#   Below TRANSITION, offset scales linearly from 0 → MOTOR_OFFSET.
+#   This avoids an abrupt PWM step at zero-crossing that causes oscillation.
+MIN_CMD        = 100
+MOTOR_OFFSET   = 30000
+TRANSITION     = 2800
+
 # ── Drive scaling ─────────────────────────────────────────────────────────────
-MAX_DRIVE_ANGLE = 1.7      # degrees of lean at full stick
-VEL_DRIVE_SCALE = 3700.0   # full stick → ±3500 ticks/sec velocity target
-TURN_SCALE      = 15000.0  # ±0.3 max turn → ±4500 PWM differential
-TRIGGER_BOOST   = 2.5      # full trigger = 2.5x balance output (1.0 + 1.5)
+MAX_DRIVE_ANGLE = 1.5       # degrees of lean at full stick
+VEL_DRIVE_SCALE = 5500.0    # full trigger → ±3700 ticks/sec velocity target
+TURN_SCALE      = 10000.0   # ±0.3 max turn → ±4500 PWM differential
+
+# Ramp rates — how fast the "current" value chases the "target" value
+VEL_RAMP_RATE   = 4000.0
+DRIVE_RAMP_RATE = 8.0
+
+# Kick — overcomes stiction when starting from rest
+KICK_PWM      = 12000.0
+KICK_DECAY    = 0.88
+KICK_MIN      = 200.0
+TRIGGER_EDGE  = 0.2
 
 # ── Outer loop (velocity) tuning ─────────────────────────────────────────────
-VEL_KP             =  0.004
-VEL_KI             =  0.002
-VEL_KD             =  0.0
-VEL_LOOP_DIV       =  10       # run every N inner loops (10 Hz)
-VEL_SETPOINT       =  0.0     # target velocity in ticks/sec — set by D command
-VEL_INTEGRAL_CLAMP =  3.0
-VEL_MAX_OFFSET     =  8.0
-VEL_D_FILTER       =  0.08
+VEL_KP = 0.002
+VEL_KI = 0.0006
+VEL_KD = 0.0
+VEL_LOOP_DIV        =  10
+VEL_SETPOINT        =  0.0
+VEL_SETPOINT_TARGET =  0.0
+VEL_INTEGRAL_CLAMP  =  1.5
+VEL_MAX_OFFSET      =  2.0
+VEL_D_FILTER        =  0.08
 
 # ── Encoder config ────────────────────────────────────────────────────────────
 TICKS_PER_REV = 2797
@@ -114,19 +146,20 @@ def maybe_print(angle, gyro_rate, output, vel, vel_offset, drive_offset, boost, 
     _print_ctr += 1
     if _print_ctr >= PRINT_EVERY:
         _print_ctr = 0
-        print(f"tilt={angle:+6.2f}  sp={SETPOINT+vel_offset+drive_offset:+5.2f}  "
-              f"gyro={gyro_rate:+7.2f}  out={output:+6.0f}  "
-              f"vel={vel:+7.1f}  voff={vel_offset:+5.2f}  "
-              f"doff={drive_offset:+5.2f}  boost={boost:.2f}  turn={turn:+5.2f}")
+        print(f"tilt={angle:+6.2f}  out={output:+6.0f}  "
+              f"vel={vel:+7.1f}  vsp={VEL_SETPOINT:+6.0f}  voff={vel_offset:+5.2f}  "
+              f"doff={drive_offset:+5.2f}  boost={boost:.2f}  "
+              f"L#={enc_left.ticks:+8d}  R#={enc_right.ticks:+8d}  "
+              f"kick={kick_pwm:+6.0f}")
 
 # ── MPU-6050 ──────────────────────────────────────────────────────────────────
 MPU_ADDR = 0x68
 i2c = I2C(0, sda=Pin(0), scl=Pin(1), freq=400_000)
 
 def mpu_init():
-    i2c.writeto_mem(MPU_ADDR, 0x6B, b'\x00')  # wake
-    i2c.writeto_mem(MPU_ADDR, 0x1C, b'\x00')  # accel ±2 g
-    i2c.writeto_mem(MPU_ADDR, 0x1B, b'\x08')  # gyro ±500 °/s
+    i2c.writeto_mem(MPU_ADDR, 0x6B, b'\x00')
+    i2c.writeto_mem(MPU_ADDR, 0x1C, b'\x00')
+    i2c.writeto_mem(MPU_ADDR, 0x1B, b'\x08')
 
 IMU_OFF = {'gx': -109, 'gy': 337, 'gz': 25}
 
@@ -149,7 +182,7 @@ def update_angle(ax, ay, az, gy):
     tilt_angle  = ALPHA * (tilt_angle + gyro_rate * DT) + (1 - ALPHA) * accel_angle
     return tilt_angle
 
-# ── L298N ─────────────────────────────────────────────────────────────────────
+# ── L298N with smooth deadband feedforward ───────────────────────────────────
 def make_motor(pwm_pin, in1_pin, in2_pin):
     pwm = PWM(Pin(pwm_pin)); pwm.freq(20_000)
     in1 = Pin(in1_pin, Pin.OUT)
@@ -157,14 +190,32 @@ def make_motor(pwm_pin, in1_pin, in2_pin):
     return pwm, in1, in2
 
 def drive(motor, speed):
+    """Drive with smooth deadband compensation.
+
+    The offset ramps in linearly between MIN_CMD and TRANSITION, so the
+    motor PWM doesn't have an abrupt step at zero-crossing. Above
+    TRANSITION the full MOTOR_OFFSET is applied.
+    """
     pwm, in1, in2 = motor
-    spd = max(-MAX_OUTPUT, min(MAX_OUTPUT, int(speed)))
-    if abs(spd) < MIN_PWM:
+    spd = int(speed)
+    abs_spd = abs(spd)
+
+    if abs_spd < MIN_CMD:
         in1.off(); in2.off(); pwm.duty_u16(0)
-    elif spd > 0:
-        in1.on();  in2.off(); pwm.duty_u16(spd)
+        return
+
+    # Smooth ramp of the offset
+    if abs_spd < TRANSITION:
+        offset = MOTOR_OFFSET * (abs_spd / TRANSITION)
     else:
-        in1.off(); in2.on();  pwm.duty_u16(-spd)
+        offset = MOTOR_OFFSET
+
+    actual = min(MAX_OUTPUT, abs_spd + int(offset))
+
+    if spd > 0:
+        in1.on();  in2.off(); pwm.duty_u16(actual)
+    else:
+        in1.off(); in2.on();  pwm.duty_u16(actual)
 
 def stop_motors():
     drive(motor_l, 0)
@@ -182,7 +233,7 @@ _uart = UART(1, baudrate=115200, tx=Pin(8), rx=Pin(9))
 _serial_buf = b''
 
 # ── PID state ─────────────────────────────────────────────────────────────────
-_d_buf = [0.0] * 5  # last 5 samples
+_d_buf = [0.0] * 5
 _d_idx = 0
 integral    = 0.0
 prev_angle  = 0.0
@@ -205,7 +256,6 @@ def pid_step(angle, setpoint):
     raw_d = (prev_angle - angle) / DT
     prev_angle = angle
 
-    # Moving average filter
     _d_buf[_d_idx] = raw_d
     _d_idx = (_d_idx + 1) % len(_d_buf)
     filtered_d = sum(_d_buf) / len(_d_buf)
@@ -217,10 +267,10 @@ def pid_step(angle, setpoint):
 vel_integral   = 0.0
 vel_prev_error = 0.0
 vel_filtered_d = 0.0
-vel_offset     = 0.0      # angle offset fed to inner loop
+vel_offset     = 0.0
 prev_ticks_l   = 0
 prev_ticks_r   = 0
-avg_velocity   = 0.0      # ticks/sec, for telemetry
+avg_velocity   = 0.0
 
 def velocity_step():
     global vel_integral, vel_prev_error, vel_filtered_d, vel_offset
@@ -251,16 +301,30 @@ def velocity_step():
     offset = VEL_KP * error + VEL_KI * vel_integral + VEL_KD * vel_filtered_d
     vel_offset = max(-VEL_MAX_OFFSET, min(VEL_MAX_OFFSET, offset))
 
+# ── Ramp helper ───────────────────────────────────────────────────────────────
+def ramp_toward(current, target, rate, dt):
+    max_step = rate * dt
+    if current < target:
+        return min(current + max_step, target)
+    elif current > target:
+        return max(current - max_step, target)
+    return current
+
 # ── Serial command parser ─────────────────────────────────────────────────────
-killed       = False
-drive_offset = 0.0   # setpoint offset from joystick (degrees)
-boost_val    = 0.0   # trigger boost 0.0–1.0
-turn_cmd     = 0.0   # turn differential from joystick
+killed              = False
+drive_offset        = 0.0
+drive_offset_target = 0.0
+boost_val           = 0.0
+turn_cmd            = 0.0
+kick_pwm            = 0.0
+prev_trigger_armed  = False
 
 def parse_serial():
     global killed, _serial_buf, integral, prev_angle
     global vel_integral, vel_prev_error, vel_filtered_d, vel_offset
-    global drive_offset, boost_val, turn_cmd, VEL_SETPOINT
+    global drive_offset, drive_offset_target, boost_val, turn_cmd
+    global VEL_SETPOINT, VEL_SETPOINT_TARGET
+    global kick_pwm, prev_trigger_armed
 
     if not _uart.any():
         return
@@ -272,58 +336,66 @@ def parse_serial():
         line = line.strip().decode('utf-8', 'ignore')
 
         if line == 'K':
-            killed         = True
-            drive_offset   = 0.0
-            boost_val      = 0.0
-            turn_cmd       = 0.0
-            VEL_SETPOINT   = 0.0
-            integral       = 0.0
-            vel_integral   = 0.0
-            vel_offset     = 0.0
-            vel_filtered_d = 0.0
+            killed              = True
+            drive_offset        = 0.0
+            drive_offset_target = 0.0
+            boost_val           = 0.0
+            turn_cmd            = 0.0
+            VEL_SETPOINT        = 0.0
+            VEL_SETPOINT_TARGET = 0.0
+            integral            = 0.0
+            vel_integral        = 0.0
+            vel_offset          = 0.0
+            vel_filtered_d      = 0.0
+            kick_pwm            = 0.0
+            prev_trigger_armed  = False
             stop_motors()
             print("CMD: KILL")
 
         elif line == 'R':
-            killed         = False
-            drive_offset   = 0.0
-            boost_val      = 0.0
-            turn_cmd       = 0.0
-            VEL_SETPOINT   = 0.0
-            integral       = 0.0
-            prev_angle     = tilt_angle
-            vel_integral   = 0.0
-            vel_prev_error = 0.0
-            vel_filtered_d = 0.0
-            vel_offset     = 0.0
+            killed              = False
+            drive_offset        = 0.0
+            drive_offset_target = 0.0
+            boost_val           = 0.0
+            turn_cmd            = 0.0
+            VEL_SETPOINT        = 0.0
+            VEL_SETPOINT_TARGET = 0.0
+            integral            = 0.0
+            prev_angle          = tilt_angle
+            vel_integral        = 0.0
+            vel_prev_error      = 0.0
+            vel_filtered_d      = 0.0
+            vel_offset          = 0.0
+            kick_pwm            = 0.0
+            prev_trigger_armed  = False
             enc_left.reset()
             enc_right.reset()
             print("CMD: RESUME")
 
         elif line == 'S':
-            drive_offset   = 0.0
-            boost_val      = 0.0
-            turn_cmd       = 0.0
-            VEL_SETPOINT   = 0.0
-            vel_integral   = 0.0
-            vel_prev_error = 0.0
-            vel_filtered_d = 0.0
-            vel_offset     = 0.0
+            drive_offset_target = 0.0
+            boost_val           = 0.0
+            turn_cmd            = 0.0
+            VEL_SETPOINT_TARGET = 0.0
+            prev_trigger_armed  = False
             print("CMD: STOP")
 
         elif line.startswith('D'):
             try:
-                # Format: D<float>,T<float>,B<float>
                 rest = line[1:]
                 d_str, rest2 = rest.split(',T')
                 t_str, b_str = rest2.split(',B')
                 joy_val      = float(d_str)
-                drive_offset = joy_val * MAX_DRIVE_ANGLE
-                VEL_SETPOINT = joy_val * VEL_DRIVE_SCALE
-                turn_cmd     = float(t_str)
                 boost_val    = float(b_str)
-                print(f"CMD: doff={drive_offset:+.2f}°  vsp={VEL_SETPOINT:+.0f}  "
-                      f"turn={turn_cmd:+.3f}  boost={boost_val:.2f}")
+                turn_cmd     = float(t_str)
+
+                drive_offset_target = joy_val  * MAX_DRIVE_ANGLE
+                VEL_SETPOINT_TARGET = boost_val * VEL_DRIVE_SCALE
+
+                trigger_armed = boost_val > TRIGGER_EDGE
+                if trigger_armed and not prev_trigger_armed:
+                    kick_pwm = KICK_PWM
+                prev_trigger_armed = trigger_armed
             except Exception:
                 print(f"CMD: parse error — '{line}'")
 
@@ -340,7 +412,9 @@ for _ in range(50):
 prev_ticks_l = enc_left.ticks
 prev_ticks_r = enc_right.ticks
 
-print("CAMS Bot — angle+vel+boost+turn — send K to kill, R to resume")
+print(f"CAMS Bot — smooth deadband (offset={MOTOR_OFFSET}, transition={TRANSITION})")
+print(f"  KP={KP}  KD={KD}  SETPOINT={SETPOINT}°")
+print("Send K to kill, R to resume")
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 next_tick = time.ticks_us()
@@ -354,31 +428,31 @@ while True:
 
         parse_serial()
 
+        VEL_SETPOINT = ramp_toward(VEL_SETPOINT, VEL_SETPOINT_TARGET, VEL_RAMP_RATE,   DT)
+        drive_offset = ramp_toward(drive_offset, drive_offset_target, DRIVE_RAMP_RATE, DT)
+
+        kick_pwm *= KICK_DECAY
+        if abs(kick_pwm) < KICK_MIN:
+            kick_pwm = 0.0
+
         ax, ay, az, gx, gy, gz = read_raw()
         angle = update_angle(ax, ay, az, gy)
 
         if killed:
             stop_motors()
         else:
-            # Outer velocity loop at 10 Hz
             loop_ctr += 1
             if loop_ctr >= VEL_LOOP_DIV:
                 loop_ctr = 0
                 velocity_step()
 
-            # Inner balance loop at 100 Hz
             effective_setpoint = SETPOINT + vel_offset + drive_offset
             output = pid_step(angle, effective_setpoint)
             _prev_output = OUTPUT_FILTER * output + (1.0 - OUTPUT_FILTER) * _prev_output
 
-            # Apply trigger boost — multiplies balance output
-            final = _prev_output * (1.0 + boost_val * TRIGGER_BOOST)
-            final = max(-MAX_OUTPUT, min(MAX_OUTPUT, final))
-
-            # Apply turn differential
             turn_pwm = turn_cmd * TURN_SCALE
-            drive(motor_l, final - turn_pwm)
-            drive(motor_r, final + turn_pwm)
+            drive(motor_l, _prev_output - turn_pwm + kick_pwm)
+            drive(motor_r, _prev_output + turn_pwm + kick_pwm)
 
         maybe_print(angle, gyro_rate,
                     output if not killed else 0,

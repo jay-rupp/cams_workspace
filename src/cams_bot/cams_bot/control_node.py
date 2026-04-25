@@ -360,8 +360,8 @@ BAUD_RATE = 115200
 
 # Axis indices
 AXIS_DRIVE = 1   # left stick Y  — forward/back
-AXIS_TURN  = 3   # right stick X — left/right
-AXIS_BOOST = 5   # right trigger — speed boost
+AXIS_TURN  = 2   # right stick X — left/right
+AXIS_BOOST = 4   # right trigger — speed boost
 
 # Button indices (Xbox controller)
 BTN_KILL   = 1   # B button — kill
